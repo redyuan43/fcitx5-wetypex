@@ -105,8 +105,8 @@ foreach(qt_major 5 6)
     endif()
   endif()
 endforeach()
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-  message(FATAL_ERROR "The verified original engine sample requires Linux x86-64")
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|aarch64|arm64")
+  message(FATAL_ERROR "The original engine sample requires Linux x86-64 or arm64")
 endif()
 set(ENABLE_TESTING OFF CACHE BOOL "libkqueue tests" FORCE)
 FetchContent_Declare(kqueue
@@ -135,16 +135,35 @@ else()
   set(WETYPE_CURL_COMPILE_FLAGS ${CURL_CFLAGS})
   set(WETYPE_CURL_LINK_FLAGS ${CURL_LDFLAGS} -lcurl)
 endif()
+# Apple's arm64 libc++ uses the alternate std::string layout (characters first,
+# size byte at offset 23), while Linux libc++ uses the classic layout. The
+# engine hands std::string/path objects straight to these bridges, so they must
+# be built against a libc++ configured the same way (see README: abi2).
+set(WETYPE_LIBCXX_ABI_FLAGS "")
+set(WETYPE_LIBCXX_ABI_LINK_FLAGS "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  if(WETYPE_LIBCXX_ABI2_PREFIX)
+    set(WETYPE_LIBCXX_ABI_FLAGS
+        -nostdinc++ -isystem ${WETYPE_LIBCXX_ABI2_PREFIX}/include/c++/v1)
+    set(WETYPE_LIBCXX_ABI_LINK_FLAGS
+        -L${WETYPE_LIBCXX_ABI2_PREFIX}/lib
+        -Wl,-rpath,${WETYPE_LIBCXX_ABI2_PREFIX}/lib -lc++abi)
+  endif()
+endif()
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/wetypex-locale.so
-  COMMAND ${WETYPE_CLANGXX} -std=c++17 -stdlib=libc++ -shared -fPIC -O2
+  COMMAND ${WETYPE_CLANGXX} -std=c++17 -stdlib=libc++ ${WETYPE_LIBCXX_ABI_FLAGS}
+  -shared -fPIC -O2
   ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/darwin_locale.cpp -ldl -pthread
+  ${WETYPE_LIBCXX_ABI_LINK_FLAGS}
   -Wl,-z,relro,-z,now -o ${CMAKE_CURRENT_BINARY_DIR}/wetypex-locale.so
   DEPENDS src/backend/darwin_locale.cpp VERBATIM)
 add_custom_target(wetypex-locale ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/wetypex-locale.so)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so
-  COMMAND ${WETYPE_CLANGXX} -std=c++17 -stdlib=libc++ -shared -fPIC -O2
+  COMMAND ${WETYPE_CLANGXX} -std=c++17 -stdlib=libc++ ${WETYPE_LIBCXX_ABI_FLAGS}
+  -shared -fPIC -O2
   ${WETYPE_CURL_COMPILE_FLAGS} ${CMAKE_CURRENT_SOURCE_DIR}/src/backend/wcwss_bridge.cpp
-  ${WETYPE_CURL_LINK_FLAGS} -pthread -Wl,-z,relro,-z,now,-z,defs
+  ${WETYPE_CURL_LINK_FLAGS} -pthread ${WETYPE_LIBCXX_ABI_LINK_FLAGS}
+  -Wl,-z,relro,-z,now,-z,defs
   -o ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so
   DEPENDS src/backend/wcwss_bridge.cpp ${WETYPE_CURL_LIBRARY} VERBATIM COMMAND_EXPAND_LISTS)
 add_custom_target(wetypex-wcwss-bridge ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/wcwss_bridge.so)

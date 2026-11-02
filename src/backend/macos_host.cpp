@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <cwctype>
 #include <deque>
 #include <dirent.h>
@@ -55,6 +56,10 @@ static std::map<std::string, uintptr_t> syms;
 static std::vector<std::pair<uintptr_t, std::string>> address_names;
 static std::vector<std::pair<uintptr_t, uintptr_t>> mapped_image_ranges;
 static uintptr_t tls_data = 0, tls_size = 0, tls_total = 0;
+// The Mach-O image carries a real DWARF __eh_frame; on aarch64 we hand it to
+// libgcc so C++ exceptions can unwind through engine frames.
+static uintptr_t eh_frame_addr = 0, eh_frame_size = 0;
+static std::string runtime_dir_path;
 static uintptr_t stack_guard = 0xa35197bd82e436c1ULL;
 static bool service_mode = false;
 struct FlurryLocalCredentials {
@@ -1578,13 +1583,21 @@ extern "C" int shim_sysctlbyname(const char *name, void *old_value,
     if (!text || !*text)
       text = "LINUX";
   } else if (!strcmp(name, "hw.machine")) {
+#if defined(__aarch64__)
+    text = "arm64";
+#else
     text = "x86_64";
+#endif
   } else if (!strcmp(name, "kern.osrelease")) {
     text = "24.2.0";
   } else if (!strcmp(name, "kern.osproductversion")) {
     text = "15.2";
   } else if (!strcmp(name, "machdep.cpu.brand_string")) {
+#if defined(__aarch64__)
+    text = "Linux arm64";
+#else
     text = "Linux x86_64";
+#endif
   }
   if (text)
     return sysctl_copy(text, strlen(text) + 1, old_value, old_size);
@@ -1627,8 +1640,41 @@ extern "C" __attribute__((used, noinline)) void *shim_tlv_impl(void *d) {
   }
   return (char *)block + desc->off;
 }
+#if !defined(__aarch64__)
 extern "C" void shim_tlv();
 extern "C" void shim_chkstk();
+#endif
+#if defined(__aarch64__)
+// AArch64: __tlv_bootstrap is a plain function call (descriptor in x0), so a
+// thin wrapper suffices — no register save/restore trampoline is needed the
+// way the x86_64 TLS-descriptor ABI requires.
+extern "C" void *shim_tlv(void *d) { return shim_tlv_impl(d); }
+// AArch64 stack probe. The Darwin helper is not a normal function: the frame
+// size arrives in x9 (x0 still holds whatever the C++ function was doing with
+// it), it must not move sp, and it must not clobber anything the prologue still
+// needs. Callers look like
+//
+//   mov w9, #0x1460
+//   ldr x16, [x16, ___chkstk_darwin]
+//   blr x16
+//   sub sp, sp, #0x1000        ; the caller adjusts sp itself
+//
+// so the only job here is to touch one byte per page below the caller's frame.
+extern "C" void shim_chkstk();
+extern "C" void shim_chkstk_impl(uintptr_t size);
+asm(".text\n"
+    ".global shim_chkstk\n"
+    "shim_chkstk:\n"
+    "  mov x0, x9\n"
+    "  b shim_chkstk_impl\n");
+extern "C" void shim_chkstk_impl(uintptr_t size) {
+  uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+  if (size > here)
+    return;
+  for (uintptr_t probe = here - 4096; probe > here - size; probe -= 4096)
+    (void)*(volatile unsigned char *)probe;
+}
+#else
 asm(".text\n.global shim_chkstk\nshim_chkstk:\npush %rcx\npush %rax\nlea "
     "24(%rsp),%rcx\n"
     "cmp $4096,%rax\njb 2f\n1: sub $4096,%rcx\ntestb $0,(%rcx)\nsub "
@@ -1655,6 +1701,7 @@ asm(".text\n.global shim_tlv\nshim_tlv:\n"
     "224(%rsp),%xmm14\nmovdqu 240(%rsp),%xmm15\n"
     "add $264,%rsp\npop %r11\npop %r10\npop %r9\npop %r8\npop %rcx\npop "
     "%rdx\npop %rsi\npop %rdi\nret\n");
+#endif
 extern "C" int __cxa_thread_atexit_impl(void (*)(void *), void *, void *);
 extern "C" int shim_tlv_atexit(void (*f)(void *), void *p) {
   return __cxa_thread_atexit_impl(f, p, (void *)&stack_guard);
@@ -1669,8 +1716,84 @@ static void show_address(uintptr_t pc) {
   } else
     fprintf(stderr, "0x%lx\n", pc);
 }
+static unsigned char *trap_arena;
+static size_t trap_offset;
+static void crash_region(const char *label, uintptr_t addr) {
+  FILE *m = fopen("/proc/self/maps", "r");
+  if (!m)
+    return;
+  char line[512];
+  while (fgets(line, sizeof line, m)) {
+    unsigned long lo, hi;
+    if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && addr >= lo && addr < hi) {
+      fprintf(stderr, "MAPS %s 0x%lx -> %s", label, (unsigned long)addr, line);
+      break;
+    }
+  }
+  fclose(m);
+}
 static void crash(int sig, siginfo_t *info, void *ctx) {
   auto uc = (ucontext_t *)ctx;
+#if defined(__aarch64__)
+  fprintf(stderr, "FAULT signal=%d code=%d address=%p pc=", sig, info->si_code,
+          info->si_addr);
+  show_address(uc->uc_mcontext.pc);
+  fprintf(stderr, "REG x0=%llx x1=%llx x2=%llx x3=%llx sp=%llx lr=%llx\n",
+          (long long)uc->uc_mcontext.regs[0],
+          (long long)uc->uc_mcontext.regs[1],
+          (long long)uc->uc_mcontext.regs[2],
+          (long long)uc->uc_mcontext.regs[3],
+          (long long)uc->uc_mcontext.sp,
+          (long long)uc->uc_mcontext.regs[30]);
+  {
+    uintptr_t pc = uc->uc_mcontext.pc;
+    fprintf(stderr, "INSN @pc: ");
+    for (int k = 0; k < 4; ++k)
+      fprintf(stderr, "%08x ", *(uint32_t *)(pc + k * 4));
+    fprintf(stderr, "\n");
+    fprintf(stderr, "TRAPS total=%zu pc_index=%ld arena=%p\n",
+            trap_offset / 32, (long)((pc - (uintptr_t)trap_arena) / 32),
+            (void *)trap_arena);
+    crash_region("pc", pc);
+    crash_region("lr", uc->uc_mcontext.regs[30]);
+    crash_region("x1", uc->uc_mcontext.regs[1]);
+    crash_region("x3", uc->uc_mcontext.regs[3]);
+    if (getenv("WETYPE_FAULT_PROBE")) {
+      auto find =
+          (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "_Unwind_Find_FDE");
+      if (find) {
+        Dl_info who{};
+        dladdr((void *)find, &who);
+        fprintf(stderr, "FDE lookup impl: %s\n", who.dli_fname ? who.dli_fname : "?");
+        // Scan the engine core a page at a time: a frame whose page has no FDE
+        // cannot be unwound, which is exactly how a throw escapes a try block.
+        // libgcc stores into bases unconditionally, so it cannot be NULL.
+        struct { void *tbase, *dbase, *func; } bases{};
+        size_t have = 0, total = 0;
+        for (uintptr_t q = 0x100500000UL; q < 0x101000000UL; q += 0x1000) {
+          total++;
+          if (find((void *)q, &bases))
+            have++;
+        }
+        fprintf(stderr, "FDE coverage core: %zu/%zu pages\n", have, total);
+        const uintptr_t hot[] = {0x100682b40UL, 0x100682b6bUL, 0x100682c00UL,
+                                 0x100f40588UL, 0x100500000UL, 0x1007b1f00UL};
+        for (uintptr_t q : hot)
+          fprintf(stderr, "FDE %lx -> %p\n", (unsigned long)q,
+                  find((void *)q, &bases));
+      } else
+        fprintf(stderr, "FDE probe: _Unwind_Find_FDE missing\n");
+    }
+    if (pc >= (uintptr_t)trap_arena &&
+        pc < (uintptr_t)trap_arena + 1048576) {
+      fprintf(stderr, "TRAPDATA fn=%p name=%p\n", *(void **)(pc + 16),
+              *(void **)(pc + 24));
+      if (*(void **)(pc + 24))
+        fprintf(stderr, "TRAPNAME %s\n", *(char **)(pc + 24));
+    }
+  }
+  auto sp = (uintptr_t *)uc->uc_mcontext.sp;
+#else
   fprintf(stderr, "FAULT signal=%d address=%p rip=", sig, info->si_addr);
   show_address(uc->uc_mcontext.gregs[REG_RIP]);
   fprintf(stderr, "REG rdi=%llx rsi=%llx rdx=%llx rax=%llx rbp=%llx rsp=%llx\n",
@@ -1681,6 +1804,7 @@ static void crash(int sig, siginfo_t *info, void *ctx) {
           (long long)uc->uc_mcontext.gregs[REG_RBP],
           (long long)uc->uc_mcontext.gregs[REG_RSP]);
   auto sp = (uintptr_t *)uc->uc_mcontext.gregs[REG_RSP];
+#endif
   for (int i = 0; i < 12; ++i) {
     if (sp[i] >= 0x100000000 && sp[i] < 0x104000000)
       show_address(sp[i]);
@@ -1691,8 +1815,6 @@ extern "C" void missing_symbol(const char *n) {
   fprintf(stderr, "UNIMPLEMENTED %s\n", n);
   _exit(85);
 }
-static unsigned char *trap_arena = nullptr;
-static size_t trap_offset = 0;
 static void *trap(const std::string &n) {
   if (!trap_arena) {
     trap_arena = (unsigned char *)mmap(nullptr, 1048576, PROT_READ | PROT_WRITE,
@@ -1705,15 +1827,27 @@ static void *trap(const std::string &n) {
   auto code = trap_arena + trap_offset;
   trap_offset += 32;
   char *name = strdup(n.c_str());
+  void *fn = (void *)&missing_symbol;
+#if defined(__aarch64__)
+  // Emit: ldr x0,[pc,#24] (name) ; ldr x1,[pc,#12] (fn) ; br x1
+  // LDR (literal) 64-bit: 01 011 0 00 imm19 Rt, offset = imm19*4.
+  // 0x58000000 base, NOT 0x59000000 (that is LDRSW, 32-bit sign-extend).
+  uint32_t insns[3] = {0x580000C0, 0x58000061, 0xd61f0020};
+  memcpy(code, insns, 12);
+  memcpy(code + 16, &fn, 8);
+  memcpy(code + 24, &name, 8);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "TRAP %zu %s\n", trap_offset / 32 - 1, n.c_str());
+#else
   code[0] = 0x48;
   code[1] = 0xbf;
   memcpy(code + 2, &name, 8);
-  void *fn = (void *)&missing_symbol;
   code[10] = 0x48;
   code[11] = 0xb8;
   memcpy(code + 12, &fn, 8);
   code[20] = 0xff;
   code[21] = 0xe0;
+#endif
   return code;
 }
 struct DispatchSemaphore {
@@ -2462,6 +2596,468 @@ static void shim_uuid_unparse(const unsigned char *value, char *output) {
            value[7], value[8], value[9], value[10], value[11], value[12],
            value[13], value[14], value[15]);
 }
+// The arm64 slice of the engine enters a few `@autoreleasepool` scopes in code
+// paths the x86-64 slice reaches without them, so the ObjC autorelease-pool
+// entry points must exist. Linux has no ObjC runtime here and the C++ core
+// never puts a real object in a pool, but the token still has to be a writable
+// object: the compiler stores bookkeeping at a fixed offset from it, so
+// handing back NULL faults on the first `strb wzr, [x0, #64]`.
+extern "C" void *shim_objc_autorelease_pool_push() {
+  static thread_local unsigned char page[4096];
+  memset(page, 0, sizeof page);
+  return page;
+}
+extern "C" void shim_objc_autorelease_pool_pop(void *) {}
+// The engine's libc++ is Apple's, whose std::string uses the alternate layout
+// (characters at offset 0, size byte at offset 23). The host libc++ uses the
+// default layout (size at offset 0, characters at offset 1), so a std::string
+// built by the engine is unreadable here — sizeof() and data() both come out
+// garbage, which is what makes libc++'s random_device ctor allocate ~1.8 GB
+// and throw bad_alloc. random_device is the only libc++ object the core hands
+// across this boundary, so service it natively and never look at the token.
+extern "C" void shim_random_device_ctor(void *self, const void *) {
+  unsigned long long seed = 0;
+  if (FILE *f = fopen("/dev/urandom", "rb")) {
+    if (fread(&seed, 1, sizeof seed, f) != sizeof seed)
+      seed = 0;
+    fclose(f);
+  }
+  if (!seed)
+    seed = (unsigned long long)time(nullptr) ^ (uintptr_t)self ^
+           (unsigned long long)clock();
+  *(unsigned long long *)self = seed;
+}
+extern "C" unsigned shim_random_device_call(void *self) {
+  // xorshift64*, so repeated calls advance instead of repeating one seed.
+  auto state = (unsigned long long *)self;
+  unsigned long long x = *state;
+  x ^= x >> 12;
+  x ^= x << 25;
+  x ^= x >> 27;
+  *state = x;
+  return (unsigned)((x * 2685821657736338717ULL) >> 32);
+}
+extern "C" void shim_random_device_dtor(void *) {}
+// --- Apple arm64 variadic bridge -------------------------------------------
+// Apple's arm64 ABI puts *every* variadic argument in memory at the caller's
+// sp; AAPCS64 (what Linux compiles for) puts the first ones in x2-x7. A shim
+// written with va_arg therefore reads leftover register contents — the engine
+// logging "%s%s%s%s" handed us 0x2/0x1 instead of string pointers and strlen
+// died on them. These trampolines capture sp at entry and hand the raw
+// argument block to a small formatter instead.
+#if defined(__aarch64__)
+static bool map_readable(uintptr_t addr) {
+  static std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    if (FILE *m = fopen("/proc/self/maps", "r")) {
+      char line[512];
+      while (fgets(line, sizeof line, m)) {
+        unsigned long lo, hi;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) == 3 && perms[0] == 'r')
+          ranges.emplace_back(lo, hi);
+      }
+      fclose(m);
+    }
+  }
+  for (auto &r : ranges)
+    if (addr >= r.first && addr < r.second)
+      return true;
+  // The snapshot predates every allocation made since it was taken, so a miss
+  // is not proof of anything: refresh once and ask again.
+  ranges.clear();
+  if (FILE *m = fopen("/proc/self/maps", "r")) {
+    char line[512];
+    while (fgets(line, sizeof line, m)) {
+      unsigned long lo, hi;
+      char perms[8] = {0};
+      if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) == 3 && perms[0] == 'r')
+        ranges.emplace_back(lo, hi);
+    }
+    fclose(m);
+  }
+  for (auto &r : ranges)
+    if (addr >= r.first && addr < r.second)
+      return true;
+  return false;
+}
+static std::string apple_vformat(const char *format, uintptr_t *args) {
+  std::string out;
+  if (!format)
+    return out;
+  const char *p = format;
+  while (*p) {
+    const char *pct = strchr(p, '%');
+    if (!pct) {
+      out.append(p);
+      break;
+    }
+    out.append(p, pct - p);
+    const char *q = pct + 1;
+    if (*q == '%') {
+      out.push_back('%');
+      p = q + 1;
+      continue;
+    }
+    std::string flags, width, precision;
+    while (*q && strchr("-+ #0'", *q))
+      flags.push_back(*q++);
+    if (*q == '*') {
+      width = std::to_string((int)(*args++));
+      ++q;
+    } else {
+      while (*q >= '0' && *q <= '9')
+        width.push_back(*q++);
+    }
+    if (*q == '.') {
+      precision.push_back('.');
+      ++q;
+      if (*q == '*') {
+        precision += std::to_string((int)(*args++));
+        ++q;
+      } else {
+        while (*q >= '0' && *q <= '9')
+          precision.push_back(*q++);
+      }
+    }
+    bool wide = false, narrow = false;
+    while (*q == 'l' || *q == 'h' || *q == 'z' || *q == 'j' || *q == 't') {
+      if (*q == 'l' || *q == 'z' || *q == 'j' || *q == 't')
+        wide = true;
+      if (*q == 'h')
+        narrow = true;
+      ++q;
+    }
+    const char conv = *q;
+    if (!conv) {
+      out.append(pct);
+      break;
+    }
+    ++q;
+    char spec[96];
+    char buf[1024];
+    buf[0] = '\0';
+    const char *value = nullptr;
+    switch (conv) {
+    case 's': {
+      auto s = (const char *)(*args++);
+      snprintf(spec, sizeof spec, "%%%s%s%s%s", flags.c_str(), width.c_str(),
+               precision.c_str(), "s");
+      if (!s)
+        value = "(null)";
+      else if (!map_readable((uintptr_t)s))
+        value = "(badptr)";
+      else
+        value = s;
+      snprintf(buf, sizeof buf, spec, value);
+      break;
+    }
+    case 'c':
+      snprintf(spec, sizeof spec, "%%%s%sc", flags.c_str(), width.c_str());
+      snprintf(buf, sizeof buf, spec, (int)(*args++));
+      break;
+    case 'p':
+      snprintf(spec, sizeof spec, "%%%s%sp", flags.c_str(), width.c_str());
+      snprintf(buf, sizeof buf, spec, (void *)(*args++));
+      break;
+    case 'd':
+    case 'i':
+      snprintf(spec, sizeof spec, "%%%s%s%sll%c", flags.c_str(), width.c_str(),
+               precision.c_str(), conv);
+      snprintf(buf, sizeof buf, spec, (long long)(int64_t)(*args++));
+      break;
+    case 'u':
+    case 'x':
+    case 'X':
+    case 'o':
+      snprintf(spec, sizeof spec, "%%%s%s%sll%c", flags.c_str(), width.c_str(),
+               precision.c_str(), conv);
+      snprintf(buf, sizeof buf, spec, (unsigned long long)(*args++));
+      break;
+    case 'f':
+    case 'F':
+    case 'g':
+    case 'G':
+    case 'e':
+    case 'E':
+    case 'a':
+    case 'A': {
+      union {
+        uintptr_t raw;
+        double d;
+      } bits{*args++};
+      snprintf(spec, sizeof spec, "%%%s%s%s%c", flags.c_str(), width.c_str(),
+               precision.c_str(), conv);
+      snprintf(buf, sizeof buf, spec, bits.d);
+      break;
+    }
+    default:
+      snprintf(buf, sizeof buf, "%%<%c?>", conv);
+      (void)wide;
+      (void)narrow;
+      break;
+    }
+    out += buf;
+    p = q;
+  }
+  return out;
+}
+extern "C" int shim_fprintf_apple(FILE *stream, const char *format,
+                                  uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  FILE *out = stream ? stream : stderr;
+  fwrite(text.data(), 1, text.size(), out);
+  return (int)text.size();
+}
+extern "C" int shim_printf_apple(const char *format, uintptr_t *args) {
+  return shim_fprintf_apple(stdout, format, args);
+}
+extern "C" int shim_snprintf_apple(char *buf, size_t cap, const char *format,
+                                   uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  if (cap) {
+    size_t n = text.size() < cap - 1 ? text.size() : cap - 1;
+    memcpy(buf, text.data(), n);
+    buf[n] = '\0';
+  }
+  return (int)text.size();
+}
+// loguru (and anything else that funnels a va_list through the C library)
+// hands us a pointer to the caller's overflow area, which is exactly the layout
+// apple_vformat walks. Passing that pointer straight to glibc's vasprintf instead
+// makes it read the argument registers and pull strings out of thin air.
+// Apple's libc++ keeps a handful of basic_string members out of line and the
+// engine calls them through the Mach-O stubs; libc++ 18 inlined or removed every
+// one of them. Each is re-expressed here on top of the string API, which is safe
+// because the layout on both sides is the same alternate-layout, ABI-version-2
+// representation.
+template <class Str>
+static void string_grow_by(Str *self, size_t old_cap, size_t delta_cap,
+                           size_t old_sz, size_t n_copy, size_t n_del,
+                           size_t n_add) {
+  if (!self)
+    return;
+  const size_t size = self->size();
+  if (old_sz > size)
+    old_sz = size;
+  if (n_copy > old_sz)
+    n_copy = old_sz;
+  if (n_del > old_sz - n_copy)
+    n_del = old_sz - n_copy;
+  const size_t target = old_cap + delta_cap;
+  const size_t capacity = target < old_cap ? old_cap : target;
+  const size_t wanted = old_sz - n_del + n_add;
+  const size_t tail = old_sz - n_copy - n_del;
+  Str next;
+  next.reserve(capacity);
+  next.append(self->data(), n_copy);
+  if (tail)
+    next.append(self->data() + n_copy + n_del, tail);
+  // The grown tail is uninitialised in Apple's version; zeroing it keeps the
+  // string well formed and the caller overwrites it anyway.
+  if (wanted > next.size())
+    next.resize(wanted, 0);
+  *self = std::move(next);
+}
+extern "C" void shim_string_grow_by(std::string *self, size_t old_cap,
+                                    size_t delta_cap, size_t old_sz,
+                                    size_t n_copy, size_t n_del, size_t n_add) {
+  string_grow_by(self, old_cap, delta_cap, old_sz, n_copy, n_del, n_add);
+}
+extern "C" void shim_wstring_grow_by(std::wstring *self, size_t old_cap,
+                                     size_t delta_cap, size_t old_sz,
+                                     size_t n_copy, size_t n_del, size_t n_add) {
+  string_grow_by(self, old_cap, delta_cap, old_sz, n_copy, n_del, n_add);
+}
+// Same story as __grow_by: Apple keeps the copy-init helper out of line. It is
+// also the one place a corrupted string shows up first, so the source pointer is
+// validated here before libc++ walks it.
+extern "C" void shim_string_init_copy(std::string *self, const char *text,
+                                      size_t count) {
+  if (text && !map_readable((uintptr_t)text))
+    fprintf(stderr, "BADSTR src=%p len=%zu caller=%p\n", (void *)text, count,
+            __builtin_return_address(0));
+  new (self) std::string(text ? text : "", count);
+}
+extern "C" void shim_string_copy_ctor(std::string *self,
+                                      const std::string *other) {
+  new (self) std::string(*other);
+}
+extern "C" void shim_string_assign_copy(std::string *self,
+                                        const std::string *other) {
+  *self = *other;
+}
+extern "C" void shim_string_assign_ptr(std::string *self, const char *text) {
+  self->assign(text ? text : "");
+}
+extern "C" void shim_string_assign_ptr_n(std::string *self, const char *text,
+                                         size_t count) {
+  self->assign(text ? text : "", count);
+}
+extern "C" std::string *shim_string_erase(std::string *self, size_t pos,
+                                          size_t count) {
+  self->erase(pos, count);
+  return self;
+}
+extern "C" void shim_wstring_copy_ctor(std::wstring *self,
+                                       const std::wstring *other) {
+  new (self) std::wstring(*other);
+}
+extern "C" void shim_wstring_assign_copy(std::wstring *self,
+                                         const std::wstring *other) {
+  *self = *other;
+}
+
+extern "C" int shim_vasprintf(char **out, const char *format, uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  char *buffer = (char *)malloc(text.size() + 1);
+  if (!buffer)
+    return -1;
+  memcpy(buffer, text.data(), text.size() + 1);
+  if (out)
+    *out = buffer;
+  return (int)text.size();
+}
+extern "C" int shim_vsprintf(char *buf, const char *format, uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  memcpy(buf, text.data(), text.size() + 1);
+  return (int)text.size();
+}
+extern "C" int shim_vfprintf(FILE *stream, const char *format, uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  FILE *target = stream ? stream : stderr;
+  fwrite(text.data(), 1, text.size(), target);
+  return (int)text.size();
+}
+extern "C" int shim_vprintf(const char *format, uintptr_t *args) {
+  return shim_vfprintf(stdout, format, args);
+}
+
+extern "C" int shim_sprintf_apple(char *buf, const char *format,
+                                   uintptr_t *args) {
+  std::string text = apple_vformat(format, args);
+  memcpy(buf, text.data(), text.size() + 1);
+  return (int)text.size();
+}
+extern "C" int shim_vsnprintf(char *buf, size_t cap, const char *format,
+                              uintptr_t *args) {
+  return shim_snprintf_apple(buf, cap, format, args);
+}
+asm(".text\n"
+    ".global shim_fprintf\n"
+    "shim_fprintf:\n"
+    "  mov x2, sp\n"
+    "  b shim_fprintf_apple\n");
+asm(".text\n"
+    ".global shim_printf\n"
+    "shim_printf:\n"
+    "  mov x1, sp\n"
+    "  b shim_printf_apple\n");
+asm(".text\n"
+    ".global shim_snprintf\n"
+    "shim_snprintf:\n"
+    "  mov x3, sp\n"
+    "  b shim_snprintf_apple\n");
+asm(".text\n"
+    ".global shim_sprintf\n"
+    "shim_sprintf:\n"
+    "  mov x2, sp\n"
+    "  b shim_sprintf_apple\n");
+extern "C" int shim_fprintf(FILE *, const char *, ...);
+extern "C" int shim_printf(const char *, ...);
+extern "C" int shim_snprintf(char *, size_t, const char *, ...);
+extern "C" int shim_sprintf(char *, const char *, ...);
+#else
+extern "C" int shim_fprintf(FILE *stream, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int r = vfprintf(stream ? stream : stderr, format, ap);
+  va_end(ap);
+  return r;
+}
+extern "C" int shim_printf(const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int r = vfprintf(stdout, format, ap);
+  va_end(ap);
+  return r;
+}
+extern "C" int shim_snprintf(char *buf, size_t cap, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int r = vsnprintf(buf, cap, format, ap);
+  va_end(ap);
+  return r;
+}
+extern "C" int shim_sprintf(char *buf, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int r = vsprintf(buf, format, ap);
+  va_end(ap);
+  return r;
+}
+extern "C" int shim_vsnprintf(char *buf, size_t cap, const char *format,
+                              va_list ap) {
+  return vsnprintf(buf, cap, format, ap);
+}
+#endif
+#if defined(__aarch64__)
+// The Itanium C++ ABI requires a constructor or destructor to leave `this` in
+// x0 when it returns, and generated code legitimately relies on that:
+//
+//   bl  std::recursive_mutex::recursive_mutex()   ; x0 = this
+//   strb wzr, [x0, #64]                           ; fields right after it
+//
+// Our Linux libc++ build does not put x0 back (it ends with the return value of
+// pthread_mutexattr_destroy, i.e. 0), so every imported ctor/dtor is wrapped in
+// a trampoline that reinstates x0 before returning. Without this the engine
+// dereferences null immediately after constructing its first mutex.
+static bool is_ctor_or_dtor(const std::string &n) {
+  // Mach-O adds one leading underscore, so C++ names arrive as "__ZN...".
+  if (n.size() < 6 || n.compare(0, 4, "__ZN") != 0)
+    return false;
+  for (const char *k : {"C1E", "C2E", "C3E", "D0E", "D1E", "D2E"})
+    if (n.find(k) != std::string::npos)
+      return true;
+  return false;
+}
+static unsigned char *ret_this_arena;
+static size_t ret_this_offset;
+static void *return_this_trampoline(void *real) {
+  if (!ret_this_arena) {
+    ret_this_arena = (unsigned char *)mmap(nullptr, 1048576,
+                                           PROT_READ | PROT_WRITE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ret_this_arena == MAP_FAILED)
+      _exit(92);
+  }
+  if (ret_this_offset + 64 > 1048576)
+    _exit(92);
+  // Block layout (64 bytes): the wrapper at +0x00, the real entry point at
+  // +0x28 which the literal load at +0x0c reaches.
+  unsigned char *base = ret_this_arena + ret_this_offset;
+  ret_this_offset += 64;
+  uint32_t insns[10] = {
+      0xa9be7bfd, // stp x29, x30, [sp, #-32]!
+      0xa90153f3, // stp x19, x20, [sp, #16]
+      0xaa0003f3, // mov x19, x0            (keep this)
+      0x580000f4, // ldr x20, [pc, #0x1c]   -> real entry at base+0x28
+      0xd63f0280, // blr x20
+      0xaa1303e0, // mov x0, x19            (ABI: return this)
+      0xa94153f3, // ldp x19, x20, [sp, #16]
+      0xa8c27bfd, // ldp x29, x30, [sp], #32
+      0xd65f03c0, // ret
+      0xd503201f, // nop (pad to the literal at +0x28)
+  };
+  memcpy(base, insns, sizeof insns);
+  memcpy(base + 0x28, &real, 8);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "CTORWRAP %p -> %p\n", (void *)base, real);
+  return base;
+}
+#endif
 static void *resolve(const std::string &name) {
   if (auto symbol = syms.find(name); symbol != syms.end())
     return reinterpret_cast<void *>(symbol->second);
@@ -2477,8 +3073,54 @@ static void *resolve(const std::string &name) {
       {"___stdinp", &stdin},
       {"__tlv_bootstrap", (void *)shim_tlv},
       {"__tlv_atexit", (void *)shim_tlv_atexit},
+      // Apple names the stack probe differently per architecture: x86_64
+      // imports `____chkstk_darwin`, arm64 imports `___chkstk_darwin`.
       {"____chkstk_darwin", (void *)shim_chkstk},
+      {"___chkstk_darwin", (void *)shim_chkstk},
+      {"_objc_autoreleasePoolPush", (void *)shim_objc_autorelease_pool_push},
+      {"__objc_autoreleasePoolPush", (void *)shim_objc_autorelease_pool_push},
+      {"_objc_autoreleasePoolPop", (void *)shim_objc_autorelease_pool_pop},
+      {"__objc_autoreleasePoolPop", (void *)shim_objc_autorelease_pool_pop},
+      {"__ZNSt3__113random_deviceC1ERKNS_12basic_stringIcNS_11char_traitsIcEENS_"
+       "9allocatorIcEEEE",
+       (void *)shim_random_device_ctor},
+      {"__ZNSt3__113random_deviceclEv", (void *)shim_random_device_call},
+      {"__ZNSt3__113random_deviceD1Ev", (void *)shim_random_device_dtor},
       {"_dlsym", (void *)shim_dlsym},
+      {"_fprintf", (void *)shim_fprintf},
+      {"_printf", (void *)shim_printf},
+      {"_snprintf", (void *)shim_snprintf},
+      {"_sprintf", (void *)shim_sprintf},
+      {"_vsnprintf", (void *)shim_vsnprintf},
+      {"_vasprintf", (void *)shim_vasprintf},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE9__"
+       "grow_byEmmmmmm",
+       (void *)shim_string_grow_by},
+      {"__ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEE9__"
+       "grow_byEmmmmmm",
+       (void *)shim_wstring_grow_by},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEC1E"
+       "RKS5_",
+       (void *)shim_string_copy_ctor},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE25"
+       "__init_copy_ctor_externalEPKcm",
+       (void *)shim_string_init_copy},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEEaSERKS5_",
+       (void *)shim_string_assign_copy},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKc",
+       (void *)shim_string_assign_ptr},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE6assignEPKcm",
+       (void *)shim_string_assign_ptr_n},
+      {"__ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE5eraseEmm",
+       (void *)shim_string_erase},
+      {"__ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEEC1E"
+       "RKS5_",
+       (void *)shim_wstring_copy_ctor},
+      {"__ZNSt3__112basic_stringIwNS_11char_traitsIwEENS_9allocatorIwEEEaSERKS5_",
+       (void *)shim_wstring_assign_copy},
+      {"_vsprintf", (void *)shim_vsprintf},
+      {"_vfprintf", (void *)shim_vfprintf},
+      {"_vprintf", (void *)shim_vprintf},
       {"_malloc_create_zone", (void *)shim_malloc_create_zone},
       {"_malloc_default_zone", (void *)shim_malloc_default_zone},
       {"_malloc_set_zone_name", (void *)shim_malloc_set_zone_name},
@@ -2609,7 +3251,12 @@ static void *resolve(const std::string &name) {
   // Never attempt to use macOS framework objects as native ELF objects.
   if (name.rfind("_OBJC_", 0) == 0 || name.rfind("_$s", 0) == 0)
     return nullptr;
-  return dlsym(RTLD_DEFAULT, name.c_str() + 1);
+  void *raw = dlsym(RTLD_DEFAULT, name.c_str() + 1);
+#if defined(__aarch64__)
+  if (raw && is_ctor_or_dtor(name))
+    return return_this_trampoline(raw);
+#endif
+  return raw;
 }
 static void exception_callback(const char *s, unsigned len) {
   fprintf(stderr, "ENGINE_EXCEPTION %.*s\n", (int)len, s);
@@ -2801,7 +3448,233 @@ static void record(std::vector<unsigned char> &b) {
   emit32(ehframe, b.size());
   ehframe.insert(ehframe.end(), b.begin(), b.end());
 }
+#if defined(__aarch64__)
+// ---------------------------------------------------------------------------
+// Personality diagnostics for the generated unwind table.
+//
+// The compact-unwind translation points every CIE at libgcc's
+// __gxx_personality_v0. When a catch fails, all we see is "unwinding ran off
+// the top of the stack", with no way to tell which frame declined the handler.
+// This wrapper answers that per frame: the instruction pointer, the FDE's
+// function start, whether the frame carries an LSDA at all, and, if it does,
+// whether the call-site table actually covers the faulting address.
+extern "C" int wetypex_personality_v0(int version, int actions, uint64_t cls,
+                                      void *exc, void *ctx) {
+  static auto real = (int (*)(int, int, uint64_t, void *, void *))dlsym(
+      RTLD_DEFAULT, "__gxx_personality_v0");
+  static auto get_ip =
+      (uintptr_t(*)(void *))dlsym(RTLD_DEFAULT, "_Unwind_GetIP");
+  static auto get_region =
+      (uintptr_t(*)(void *))dlsym(RTLD_DEFAULT, "_Unwind_GetRegionStart");
+  static auto get_lsda =
+      (void *(*)(void *))dlsym(RTLD_DEFAULT, "_Unwind_GetLanguageSpecificData");
+  uintptr_t ip = get_ip ? get_ip(ctx) : 0;
+  uintptr_t region = get_region ? get_region(ctx) : 0;
+  const unsigned char *lsda =
+      get_lsda ? (const unsigned char *)get_lsda(ctx) : nullptr;
+  if (getenv("WETYPE_PSN_TRACE"))
+    fprintf(stderr, "PSN enter ip=%lx func=%lx lsda=%p%s act=%d\n",
+            (unsigned long)ip, (unsigned long)region, (void *)lsda,
+            (lsda && ((uintptr_t)lsda < 0x100000000UL ||
+                      (uintptr_t)lsda >= 0x103140000UL))
+                ? "  <== OUT OF IMAGE"
+                : "",
+            actions);
+  int rc = real(version, actions, cls, exc, ctx);
+  if (getenv("WETYPE_PSN_TRACE"))
+    fprintf(stderr, "PSN call ip=%lx func=%lx lsda=%p act=%d rc=%d\n",
+            (unsigned long)ip, (unsigned long)region, (void *)lsda, actions, rc);
+  // Only the search phase can decline a handler; phase two must install one.
+  if (getenv("WETYPE_PSN_DEBUG") && (actions & 1) && rc == 8) {
+    fprintf(stderr, "PSN decline ip=%lx func=%lx lsda=%p range=%ld\n",
+            (unsigned long)ip, (unsigned long)region, (void *)lsda,
+            (long)(ip - region));
+    if (!lsda) {
+      fprintf(stderr, "     no LSDA on this frame\n");
+      return rc;
+    }
+    static unsigned char buf[768];
+    size_t n = 0;
+    const unsigned char *p = lsda;
+    unsigned char lpstart = *p++;
+    if (lpstart != 0xff) {
+      // This image never emits an encoded LPStart, but stay aligned if it does.
+      unsigned char fmt = lpstart & 0x0f;
+      if (fmt == 0x01 || fmt == 0x02 || fmt == 0x0a)
+        p += 2;
+      else if (fmt == 0x03 || fmt == 0x0b)
+        p += 4;
+      else if (fmt == 0x04 || fmt == 0x0c)
+        p += 8;
+    }
+    unsigned char ttype_enc = *p++;
+    auto rd = [](const unsigned char *&q) {
+      uint64_t v = 0;
+      int s = 0;
+      unsigned char c;
+      do {
+        c = *q++;
+        v |= (uint64_t)(c & 127) << s;
+        s += 7;
+      } while (c & 128);
+      return v;
+    };
+    uint64_t ttype_off = rd(p);
+    unsigned char cs_enc = *p++;
+    uint64_t cs_len = rd(p);
+    const unsigned char *cs = p;
+    n += (size_t)snprintf((char *)buf + n, sizeof buf - n,
+                          "     lsda=%lx lpstart=%02x ttype_enc=%02x "
+                          "ttype_off=%lx cs_enc=%02x cs_len=%lx",
+                          (unsigned long)(uintptr_t)lsda, lpstart, ttype_enc,
+                          (unsigned long)ttype_off, cs_enc,
+                          (unsigned long)cs_len);
+    const unsigned char *q = cs;
+    const unsigned char *end = cs + cs_len;
+    int idx = 0;
+    while (q < end && n < sizeof buf - 96) {
+      uint64_t start = rd(q), len = rd(q), land = rd(q), act = rd(q);
+      bool hit = ip >= region + start && ip < region + start + len;
+      n += (size_t)snprintf((char *)buf + n, sizeof buf - n,
+                            "\n     cs[%d] +%lx..+%lx land=%lx act=%lu%s", idx,
+                            (unsigned long)start,
+                            (unsigned long)(start + len), (unsigned long)land,
+                            (unsigned long)act, hit ? "  <== covers ip" : "");
+      idx++;
+    }
+    fprintf(stderr, "%s\n", (char *)buf);
+  }
+  return rc;
+}
+#endif
+
+#if defined(__aarch64__)
+// libgcc keeps the registration bookkeeping for __register_frame in a single
+// static struct object, so calling it twice silently replaces the first table.
+// Each table therefore gets its own object block through __register_frame_info.
+static bool register_eh_frame(const void *begin, unsigned char *object) {
+  static auto info = (void (*)(const void *, void *))dlsym(
+      RTLD_DEFAULT, "__register_frame_info");
+  static auto reg = (void (*)(void *))dlsym(RTLD_DEFAULT, "__register_frame");
+  if (getenv("WETYPE_UNWIND_DEBUG"))
+    fprintf(stderr, "UNWIND api info=%p reg=%p begin=%p\n", (void *)info,
+            (void *)reg, begin);
+  if (info) {
+    memset(object, 0, 256);
+    info(begin, object);
+    return true;
+  }
+  if (!reg)
+    return false;
+  reg((void *)begin);
+  return true;
+}
+
+// How many pages of the engine core resolve to an FDE right now. Registrations
+// in libgcc are silently exclusive, so this is the only way to prove that a
+// table is actually still live at the moment something is thrown.
+static size_t unwind_coverage() {
+  auto find = (void *(*)(void *, void *))dlsym(RTLD_DEFAULT, "_Unwind_Find_FDE");
+  if (!find)
+    return 0;
+  struct {
+    void *tbase, *dbase, *func;
+  } bases{};
+  size_t have = 0;
+  for (uintptr_t q = 0x100500000UL; q < 0x101000000UL; q += 0x1000)
+    if (find((void *)q, &bases))
+      have++;
+  return have;
+}
+// Backing store for the registrations; 256 bytes is comfortably more than
+// libgcc's struct object, and both blocks stay alive for the whole process.
+static unsigned char unwind_object_generated[256] __attribute__((aligned(16)));
+static unsigned char unwind_object_dwarf[256] __attribute__((aligned(16)));
+static bool generated_unwind_registered = false;
+#endif
+
 static void setup_unwind(const std::vector<std::string> &entries) {
+#if defined(__aarch64__)
+  // AArch64 frames are described by __unwind_info, a format libgcc does not
+  // understand. A build-time generator translates every entry in it into a
+  // plain .eh_frame (unwind.ehframe beside the image), which is what actually
+  // lets try/catch work: without FDEs a throw that was meant to be swallowed
+  // (a bad integer setting, a missing optional file) aborts the process.
+  // It is mapped at a fixed address because the generated pointers are
+  // pc-relative to that address, and the personality slot sits past the table.
+  {
+    static const uintptr_t kEhBase = 0x103A00000UL;
+    static const uintptr_t kPerSlot = 0x103F00000UL;
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    if (!runtime_dir_path.empty()) {
+      std::string path = runtime_dir_path + "/unwind.ehframe";
+      int fd = open(path.c_str(), O_RDONLY);
+      struct stat st {};
+      if (fd >= 0 && !fstat(fd, &st) && st.st_size > 0) {
+        size_t need = (size_t)st.st_size;
+        size_t span = (need + 0x3FFFFF) & ~(size_t)0x3FFFFF;
+        void *p = mmap((void *)kEhBase, span, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
+                       0);
+        if (p != MAP_FAILED && read(fd, p, need) == (ssize_t)need) {
+          void *slot = mmap((void *)kPerSlot, 4096, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                            -1, 0);
+          if (slot != MAP_FAILED)
+            *(void **)slot = (void *)&wetypex_personality_v0;
+          mprotect(p, span, PROT_READ | PROT_EXEC);
+          void *gcc = dlopen("libgcc_s.so.1", RTLD_NOW | RTLD_GLOBAL);
+          auto reg = (void (*)(void *))dlsym(gcc ? gcc : RTLD_DEFAULT,
+                                             "__register_frame");
+          if (reg) {
+            generated_unwind_registered =
+                register_eh_frame(p, unwind_object_generated);
+            fprintf(stderr,
+                    "UNWIND registered generated eh_frame (%zu KB at %p) "
+                    "coverage=%zu\n",
+                    need / 1024, p, unwind_coverage());
+            auto find = (void *(*)(void *, void *))dlsym(
+                gcc ? gcc : RTLD_DEFAULT, "_Unwind_Find_FDE");
+            if (find) {
+              struct {
+                void *tbase, *dbase, *func;
+              } bases{};
+              fprintf(stderr, "UNWIND probe(0x100682b40)=%p\n",
+                      find((void *)0x100682b40UL, &bases));
+            } else
+              fprintf(stderr, "UNWIND no _Unwind_Find_FDE\n");
+          }
+        } else
+          fprintf(stderr, "UNWIND generated table map/read failed: %s\n",
+                  strerror(errno));
+      } else
+        fprintf(stderr, "UNWIND no generated table at %s\n", path.c_str());
+      if (fd >= 0)
+        close(fd);
+    }
+  }
+  (void)entries;
+  // libgcc can only keep one FDE table live: a second registration silently
+  // replaces the first, which is how a fully covered core (2769 of 2816 pages)
+  // turned into a 12-page table and made every throw run off the stack. The
+  // generated table therefore wins, and the image's own __eh_frame is used only
+  // when generation was skipped.
+  if (!generated_unwind_registered) {
+    if (eh_frame_addr) {
+      if (register_eh_frame((void *)eh_frame_addr, unwind_object_dwarf))
+        fprintf(stderr,
+                "UNWIND fell back to image __eh_frame %p size=0x%lx coverage=%zu\n",
+                (void *)eh_frame_addr, (unsigned long)eh_frame_size,
+                unwind_coverage());
+      else
+        fprintf(stderr, "UNWIND __register_frame unavailable\n");
+    } else
+      fprintf(stderr, "UNWIND no __eh_frame section in manifest\n");
+  }
+  return;
+#else
   std::vector<unsigned char> cie;
   emit32(cie, 0);
   for (auto c : {1, 'z' + 0, 'P' + 0, 'L' + 0, 'R' + 0, 0, 1, 0x78, 16, 11, 0})
@@ -2840,6 +3713,7 @@ static void setup_unwind(const std::vector<std::string> &entries) {
   }
   fn(ehframe.data());
   fprintf(stderr, "UNWIND registered %zu RBP frame entries\n", entries.size());
+#endif
 }
 int main(int argc, char **argv) {
   if (argc != 3 && argc != 4) {
@@ -2865,13 +3739,20 @@ int main(int argc, char **argv) {
   sigaction(SIGBUS, &sa, nullptr);
   sigaction(SIGILL, &sa, nullptr);
   sigaction(SIGABRT, &sa, nullptr);
-  if (!dlopen("libc++.so.1", RTLD_NOW | RTLD_GLOBAL) ||
+  const char *support = getenv("WETYPE_SUPPORT_DIR");
+  std::string support_dir = support ? support : argv[1];
+  // Apple's arm64 libc++ lays std::string out differently from the distro
+  // build, so prefer the copy shipped next to the other support libraries and
+  // only fall back to the system one when it is absent (x86-64, where the two
+  // layouts agree).
+  auto libcxxPath = support_dir + "/libc++.so.1";
+  if (access(libcxxPath.c_str(), R_OK) != 0)
+    libcxxPath = "libc++.so.1";
+  if (!dlopen(libcxxPath.c_str(), RTLD_NOW | RTLD_GLOBAL) ||
       !dlopen("libc++abi.so.1", RTLD_NOW | RTLD_GLOBAL)) {
     fputs(dlerror(), stderr);
     return 2;
   }
-  const char *support = getenv("WETYPE_SUPPORT_DIR");
-  std::string support_dir = support ? support : argv[1];
   auto localePath = support_dir + "/locale.so";
   if (access(localePath.c_str(), R_OK) != 0)
     localePath = support_dir + "/wetypex-locale.so";
@@ -2917,6 +3798,7 @@ int main(int argc, char **argv) {
     return (flags & 3) == 3 && jsonReady ? 0 : 1;
   }
   std::string dir = argv[1], mode = argv[2], line;
+  runtime_dir_path = dir;
   std::vector<std::string> binds, unwinds;
   std::vector<std::pair<uintptr_t, std::string>> ctors;
   auto loadModule = [&](const std::string &moduleDir) {
@@ -3003,6 +3885,10 @@ int main(int argc, char **argv) {
         }
         if (name == "__thread_bss")
           tls_total = address + size;
+        if (name == "__eh_frame") {
+          eh_frame_addr = address;
+          eh_frame_size = size;
+        }
       }
     }
     // Older prepared runtimes omitted the app's plain C voice wrappers from
@@ -3093,6 +3979,11 @@ int main(int argc, char **argv) {
   }
   if (trap_arena && mprotect(trap_arena, 1048576, PROT_READ | PROT_EXEC))
     return 2;
+#if defined(__aarch64__)
+  if (ret_this_arena &&
+      mprotect(ret_this_arena, 1048576, PROT_READ | PROT_EXEC))
+    return 2;
+#endif
   fprintf(stderr, "MAPPED imports=%zu unresolved=%u tls=%lu\n", cache.size(),
           unresolved, tls_total);
   if (mode == "module-map")
@@ -3135,12 +4026,26 @@ int main(int argc, char **argv) {
     if (n == "__ZN5wxime5utils26SetReportExceptionCallBackEPFvPKcjE")
       ((void (*)(void (*)(const char *, unsigned)))a)(exception_callback);
   // Initialize the original C/C++ core region. AppKit/Swift UI constructors
-  // remain outside this compatibility boundary.
+  // remain outside this compatibility boundary. The address window tracks
+  // where the C/C++ core lives in the image and is architecture-specific;
+  // WETYPE_CTOR_LO / WETYPE_CTOR_HI (hex) override it for tuning.
   const bool verbose_host = getenv("WETYPE_HOST_DEBUG");
+  uintptr_t ctor_lo, ctor_hi;
+#if defined(__aarch64__)
+  ctor_lo = 0x100500000;
+  ctor_hi = 0x101000000;
+#else
+  ctor_lo = 0x1005f51c0;
+  ctor_hi = 0x101b00000;
+#endif
+  if (const char *ctor_lo_env = getenv("WETYPE_CTOR_LO"))
+    ctor_lo = strtoull(ctor_lo_env, nullptr, 16);
+  if (const char *ctor_hi_env = getenv("WETYPE_CTOR_HI"))
+    ctor_hi = strtoull(ctor_hi_env, nullptr, 16);
   for (auto &[addr, name] : ctors) {
     const bool voiceLogger = mode == "voice-service" &&
                              name.find("wx_zhiling_tlogger") != std::string::npos;
-    if (!voiceLogger && (addr < 0x1005f51c0 || addr >= 0x101b00000))
+    if (!voiceLogger && (addr < ctor_lo || addr >= ctor_hi))
       continue;
     if (verbose_host)
       fprintf(stderr, "CTOR %lx %s\n", addr, name.c_str());

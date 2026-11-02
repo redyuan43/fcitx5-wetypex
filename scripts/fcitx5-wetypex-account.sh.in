@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 umask 077
+lib64_args=""
+[ -e /lib64 ] && lib64_args="--ro-bind /lib64 /lib64"
 
 command_name="${1:-}"
 if [ "$command_name" = voice-file ]; then
@@ -167,7 +169,7 @@ run_original() {
   # database. Wait for the current short operation instead of surfacing an
   # intermittent failure when two callers overlap.
   env -i PATH="${PATH:-/usr/bin:/bin}" bwrap --unshare-pid --die-with-parent \
-      --ro-bind /usr /usr --symlink usr/lib /lib --ro-bind /lib64 /lib64 \
+      --ro-bind /usr /usr --symlink usr/lib /lib $lib64_args \
       --symlink usr/bin /bin --proc /proc --dev /dev --tmpfs /tmp \
       --dir /etc --ro-bind /etc/resolv.conf /etc/resolv.conf \
       --ro-bind /etc/hosts /etc/hosts \
